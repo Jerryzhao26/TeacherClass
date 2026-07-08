@@ -1,0 +1,6 @@
+{
+  "name": "比伯斯课销结算系统",
+  "description": "专门为培训机构设计的课消结算与提成统计工具。一键导入Excel多区域课表，智能识别单/双周频次，支持多维日期范围筛选、教师代课抵扣、个性化课时费加成配置（支持文件备份），以及一键生成并导出月度结算报表。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
