@@ -15,6 +15,7 @@ export interface Lesson {
   teacherOverride?: string;
   hoursOverride?: number;
   baseHoursOverride?: number;
+  typeOverride?: string; // "中教" or "外教" manually overridden
 }
 
 export interface ClassBlock {

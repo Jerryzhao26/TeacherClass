@@ -286,7 +286,8 @@ export default function App() {
 
         // Determine whether this actual teacher is Chinese or Foreign
         const teacherConfig = teacherBaseRates.find(r => r.teacherName.trim().toLowerCase() === actualTeacher.trim().toLowerCase());
-        const resolvedTeacherType = teacherConfig?.teacherType || 
+        const resolvedTeacherType = lesson.typeOverride || 
+                                     teacherConfig?.teacherType || 
                                      (lesson.type === '外教' || isLikelyForeignTeacher(actualTeacher) ? '外教' : '中教');
 
         const baseHours = lesson.baseHoursOverride !== undefined && lesson.baseHoursOverride !== null
@@ -374,7 +375,7 @@ export default function App() {
     if (selectedBlock && selectedLessonIndex !== null) {
       const matchedLesson = selectedBlock.lessons.find(l => l.index === selectedLessonIndex);
       if (matchedLesson) {
-        setEditType(matchedLesson.type);
+        setEditType(matchedLesson.typeOverride || matchedLesson.type);
         setEditAttendedCount(matchedLesson.attendedCount);
         setEditTeacher(matchedLesson.teacherOverride || '');
         setEditBaseHours(matchedLesson.baseHoursOverride !== undefined && matchedLesson.baseHoursOverride !== null ? String(matchedLesson.baseHoursOverride) : '');
@@ -402,7 +403,10 @@ export default function App() {
         if (l.index !== lessonIndex) return l;
         
         const newLesson = { ...l };
-        if (fields.type !== undefined) newLesson.type = fields.type;
+        if (fields.type !== undefined) {
+          newLesson.type = fields.type;
+          newLesson.typeOverride = fields.type;
+        }
         if (fields.attendedCount !== undefined) newLesson.attendedCount = fields.attendedCount;
         
         if (fields.teacherOverride !== undefined) {
