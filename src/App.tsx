@@ -284,11 +284,12 @@ export default function App() {
         const actualTeacher = lesson.teacherOverride || (sub ? sub.substituteTeacher : block.teacher);
         const isSubstituted = !!sub && !lesson.teacherOverride;
 
-        // Determine whether this actual teacher is Chinese or Foreign
+        // Determine whether this lesson's type is Chinese or Foreign
         const teacherConfig = teacherBaseRates.find(r => r.teacherName.trim().toLowerCase() === actualTeacher.trim().toLowerCase());
+        const isTeacherForeign = teacherConfig?.teacherType === '外教' || isLikelyForeignTeacher(actualTeacher);
         const resolvedTeacherType = lesson.typeOverride || 
-                                     teacherConfig?.teacherType || 
-                                     (lesson.type === '外教' || isLikelyForeignTeacher(actualTeacher) ? '外教' : '中教');
+                                     lesson.type || 
+                                     (isTeacherForeign ? '外教' : '中教');
 
         const baseHours = lesson.baseHoursOverride !== undefined && lesson.baseHoursOverride !== null
           ? lesson.baseHoursOverride

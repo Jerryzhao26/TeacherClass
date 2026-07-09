@@ -501,9 +501,9 @@ export function parseExcelWorkbook(workbook: XLSX.WorkBook): ClassBlock[] {
               }
             }
             
-            // 3. Fall back to checking the default class teacher or general defaults
+            // 3. Keep it empty if not explicitly found, so that we can fall back to the actual teacher type dynamically in the application
             if (!typeStr) {
-              typeStr = isLikelyForeignTeacher(teacher) ? '外教' : '中教';
+              typeStr = '';
             }
 
             const rawIndexVal = indexColIndex !== -1 ? lessonRow[indexColIndex] : (lessons.length + 1);
