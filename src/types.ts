@@ -34,6 +34,7 @@ export interface BonusRule {
   teacherName: string;
   classCode: string;
   bonusRate: number; // extra pay per hour (元/课时)
+  startDate?: string; // Optional start date for the bonus (YYYY-MM-DD)
   notes?: string;
 }
 

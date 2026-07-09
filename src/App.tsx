@@ -66,6 +66,7 @@ export default function App() {
   const [newRuleTeacher, setNewRuleTeacher] = useState<string>('');
   const [newRuleClassCode, setNewRuleClassCode] = useState<string>('');
   const [newRuleBonusRate, setNewRuleBonusRate] = useState<string>('');
+  const [newRuleStartDate, setNewRuleStartDate] = useState<string>('');
   const [newRuleNotes, setNewRuleNotes] = useState<string>('');
 
   // Form states for teacher base rates
@@ -327,17 +328,52 @@ export default function App() {
 
   // Unique list of teacher names currently imported or configured
   const uniqueTeachers = useMemo(() => {
-    const names = new Set<string>();
+    const namesMap = new Map<string, string>(); // lowercase -> original trimmed representation
+    
     classBlocks.forEach(b => {
-      if (b.teacher) names.add(b.teacher);
+      if (b.teacher) {
+        const trimmed = b.teacher.trim();
+        if (trimmed) {
+          namesMap.set(trimmed.toLowerCase(), trimmed);
+        }
+      }
     });
-    teacherBaseRates.forEach(r => names.add(r.teacherName));
+    
+    teacherBaseRates.forEach(r => {
+      if (r.teacherName) {
+        const trimmed = r.teacherName.trim();
+        if (trimmed) {
+          namesMap.set(trimmed.toLowerCase(), trimmed);
+        }
+      }
+    });
+    
     substitutionRecords.forEach(s => {
-      names.add(s.originalTeacher);
-      names.add(s.substituteTeacher);
+      if (s.originalTeacher) {
+        const trimmed = s.originalTeacher.trim();
+        if (trimmed) {
+          namesMap.set(trimmed.toLowerCase(), trimmed);
+        }
+      }
+      if (s.substituteTeacher) {
+        const trimmed = s.substituteTeacher.trim();
+        if (trimmed) {
+          namesMap.set(trimmed.toLowerCase(), trimmed);
+        }
+      }
     });
-    return Array.from(names).filter(Boolean);
-  }, [classBlocks, teacherBaseRates, substitutionRecords]);
+    
+    makeupRecords.forEach(m => {
+      if (m.teacherName) {
+        const trimmed = m.teacherName.trim();
+        if (trimmed) {
+          namesMap.set(trimmed.toLowerCase(), trimmed);
+        }
+      }
+    });
+    
+    return Array.from(namesMap.values());
+  }, [classBlocks, teacherBaseRates, substitutionRecords, makeupRecords]);
 
   // Unique list of classes (code and name) currently imported
   const uniqueClassesList = useMemo(() => {
@@ -487,6 +523,7 @@ export default function App() {
       teacherName: newRuleTeacher.trim(),
       classCode: newRuleClassCode.trim(),
       bonusRate: rate,
+      startDate: newRuleStartDate.trim() || undefined,
       notes: newRuleNotes.trim()
     };
 
@@ -496,6 +533,7 @@ export default function App() {
 
     // Clear form
     setNewRuleBonusRate('');
+    setNewRuleStartDate('');
     setNewRuleNotes('');
     showAlert('成功添加课时费加成规则！');
   };
@@ -812,6 +850,14 @@ export default function App() {
       };
     });
 
+    // Helper to find report entry case-insensitively and with trimming
+    const findReportEntry = (name: string) => {
+      if (!name) return null;
+      const cleanName = name.trim().toLowerCase();
+      const matchingKey = Object.keys(report).find(k => k.trim().toLowerCase() === cleanName);
+      return matchingKey ? report[matchingKey] : null;
+    };
+
     // Go through all resolved lessons in the filtered date range
     resolvedLessons.forEach(item => {
       const origTeacher = item.block.teacher;
@@ -821,34 +867,37 @@ export default function App() {
       const classCode = item.classCode;
       const date = item.lesson.dateStr;
 
+      const origReport = findReportEntry(origTeacher);
+      const actReport = findReportEntry(actTeacher);
+
       // 1. Taught sessions & Base Hours tracking
-      if (report[origTeacher]) {
-        report[origTeacher].baseHours += hours;
-        report[origTeacher].baseClassHours += baseHours;
+      if (origReport) {
+        origReport.baseHours += hours;
+        origReport.baseClassHours += baseHours;
       }
 
       if (item.isSubstituted) {
         // Original teacher is substituted OUT
-        if (report[origTeacher]) {
-          report[origTeacher].substitutedOutHours += hours;
-          report[origTeacher].substitutedOutClassHours += baseHours;
-          report[origTeacher].substitutionDetails.push(
+        if (origReport) {
+          origReport.substitutedOutHours += hours;
+          origReport.substitutedOutClassHours += baseHours;
+          origReport.substitutionDetails.push(
             `[-] ${date} 由 [${actTeacher}] 代课 ${item.block.className} (${hours} 课时 / 纯课时:${baseHours})`
           );
         }
         // Substitute teacher is substituted IN
-        if (report[actTeacher]) {
-          report[actTeacher].substitutedInHours += hours;
-          report[actTeacher].substitutedInClassHours += baseHours;
-          report[actTeacher].sessionsCount += 1;
-          report[actTeacher].substitutionDetails.push(
+        if (actReport) {
+          actReport.substitutedInHours += hours;
+          actReport.substitutedInClassHours += baseHours;
+          actReport.sessionsCount += 1;
+          actReport.substitutionDetails.push(
             `[+] ${date} 代替 [${origTeacher}] 授课 ${item.block.className} (${hours} 课时 / 纯课时:${baseHours})`
           );
         }
       } else {
         // Taught by original teacher
-        if (report[actTeacher]) {
-          report[actTeacher].sessionsCount += 1;
+        if (actReport) {
+          actReport.sessionsCount += 1;
         }
       }
 
@@ -856,13 +905,17 @@ export default function App() {
       // Bonus goes to the actual teacher who taught, provided they have a bonus rule for this class code
       const rule = bonusRules.find(r => 
         r.teacherName.trim().toLowerCase() === actTeacher.trim().toLowerCase() && 
-        r.classCode === classCode
+        r.classCode.trim().toLowerCase() === classCode.trim().toLowerCase()
       );
 
-      if (rule && report[actTeacher]) {
-        const bonusPay = baseHours * rule.bonusRate;
-        report[actTeacher].bonusHours += baseHours;
-        report[actTeacher].bonusAmount += bonusPay;
+      if (rule && actReport) {
+        // If the rule specifies a start date, only apply the bonus if the lesson date is >= the start date
+        const isEligible = !rule.startDate || date >= rule.startDate;
+        if (isEligible) {
+          const bonusPay = baseHours * rule.bonusRate;
+          actReport.bonusHours += baseHours;
+          actReport.bonusAmount += bonusPay;
+        }
       }
     });
 
@@ -875,10 +928,11 @@ export default function App() {
 
     activeMakeups.forEach(m => {
       const tName = m.teacherName;
-      if (report[tName]) {
-        report[tName].makeupHours += m.hours;
-        report[tName].sessionsCount += 1;
-        report[tName].makeupDetails.push(
+      const mReport = findReportEntry(tName);
+      if (mReport) {
+        mReport.makeupHours += m.hours;
+        mReport.sessionsCount += 1;
+        mReport.makeupDetails.push(
           `${m.dateStr} 补课: +${m.hours} 课时${m.notes ? ` (${m.notes})` : ''}`
         );
       }
@@ -1850,6 +1904,17 @@ export default function App() {
                         </div>
 
                         <div>
+                          <label className="block text-xs font-semibold text-slate-600 mb-1">生效开始日期 (可选，留空则一直加成)</label>
+                          <input 
+                            type="date" 
+                            value={newRuleStartDate}
+                            onChange={(e) => setNewRuleStartDate(e.target.value)}
+                            className="w-full text-xs border border-slate-200 rounded-lg px-3 py-2 outline-none focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500"
+                          />
+                          <p className="text-[10px] text-slate-400 mt-1">留空表示全部排课均享受加成。选择后，则仅对该日期（含）之后的课程计算加成。</p>
+                        </div>
+
+                        <div>
                           <label className="block text-xs font-semibold text-slate-600 mb-1">备注说明 (可选)</label>
                           <input 
                             type="text" 
@@ -1960,6 +2025,7 @@ export default function App() {
                               <th className="px-4 py-2.5">任课教师</th>
                               <th className="px-4 py-2.5">班级编号</th>
                               <th className="px-4 py-2.5 text-right">加成金额</th>
+                              <th className="px-4 py-2.5">生效日期</th>
                               <th className="px-4 py-2.5">备注说明</th>
                               <th className="px-4 py-2.5 text-center">操作</th>
                             </tr>
@@ -1967,7 +2033,7 @@ export default function App() {
                           <tbody className="text-xs text-slate-700 divide-y divide-slate-100">
                             {bonusRules.length === 0 ? (
                               <tr>
-                                <td colSpan={5} className="px-4 py-10 text-center text-slate-400">
+                                <td colSpan={6} className="px-4 py-10 text-center text-slate-400">
                                   暂未配置任何课时费加成。您可以在下方查看“导入班级建议”一键快速配置。
                                 </td>
                               </tr>
@@ -1977,6 +2043,15 @@ export default function App() {
                                   <td className="px-4 py-2.5 font-semibold text-slate-800">{rule.teacherName}</td>
                                   <td className="px-4 py-2.5 font-mono text-indigo-600 bg-indigo-50/20 rounded-md font-medium">{rule.classCode}</td>
                                   <td className="px-4 py-2.5 text-right font-bold text-emerald-600 font-mono">¥ {rule.bonusRate.toFixed(1)} /课时</td>
+                                  <td className="px-4 py-2.5">
+                                    {rule.startDate ? (
+                                      <span className="inline-flex items-center gap-1 bg-amber-50 text-amber-700 px-2 py-0.5 rounded font-mono text-[11px] font-medium border border-amber-100">
+                                        {rule.startDate} 起
+                                      </span>
+                                    ) : (
+                                      <span className="text-slate-400 text-[11px]">始终有效</span>
+                                    )}
+                                  </td>
                                   <td className="px-4 py-2.5 text-slate-500">{rule.notes || '--'}</td>
                                   <td className="px-4 py-2.5 text-center">
                                     <button
@@ -2183,15 +2258,17 @@ export default function App() {
 
                       <div>
                         <label className="block text-xs font-semibold text-slate-600 mb-1">实际去代课教师 (Substitute)</label>
-                        <input 
-                          type="text" 
-                          list="teachers-datalist"
-                          placeholder="实际授课的代课教师"
+                        <select 
                           value={subSubstituteTeacher}
                           onChange={(e) => setSubSubstituteTeacher(e.target.value)}
-                          className="w-full text-xs border border-slate-200 rounded-lg px-3 py-2 outline-none focus:ring-1 focus:ring-indigo-500"
+                          className="w-full text-xs border border-slate-200 rounded-lg px-3 py-2 bg-white outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer"
                           required
-                        />
+                        >
+                          <option value="">-- 选择代课教师 --</option>
+                          {uniqueTeachers.filter(t => t !== subOriginalTeacher).map(t => (
+                            <option key={t} value={t}>{t}</option>
+                          ))}
+                        </select>
                       </div>
 
                       <div>
