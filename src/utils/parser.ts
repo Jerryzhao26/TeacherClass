@@ -465,16 +465,31 @@ export function parseExcelWorkbook(workbook: XLSX.WorkBook): ClassBlock[] {
               break;
             }
 
-            // 1. First look at B列 (column index 1) of the lessonRow, since B列 is explicitly defined as "中" or "外" by user
-            const colBVal = lessonRow[1] !== null && lessonRow[1] !== undefined ? String(lessonRow[1]).trim() : '';
+            // 1. First look at the cell directly preceding the date cell (dateColIndex - 1)
             let typeStr = '';
-            
-            if (colBVal.includes('外') || colBVal.toLowerCase() === 'f' || colBVal.toLowerCase() === 'ft' || colBVal.toLowerCase() === 'w') {
-              typeStr = '外教';
-            } else if (colBVal.includes('中') || colBVal.toLowerCase() === 'c' || colBVal.toLowerCase() === 'ct' || colBVal.toLowerCase() === 'z') {
-              typeStr = '中教';
-            } else {
-              // 2. Fall back to other potential type columns if not found in Column B
+            if (dateColIndex > 0) {
+              const precVal = lessonRow[dateColIndex - 1] !== null && lessonRow[dateColIndex - 1] !== undefined 
+                ? String(lessonRow[dateColIndex - 1]).trim() 
+                : '';
+              if (precVal.includes('外') || precVal.toLowerCase() === 'f' || precVal.toLowerCase() === 'ft' || precVal.toLowerCase() === 'w') {
+                typeStr = '外教';
+              } else if (precVal.includes('中') || precVal.toLowerCase() === 'c' || precVal.toLowerCase() === 'ct' || precVal.toLowerCase() === 'z') {
+                typeStr = '中教';
+              }
+            }
+
+            // 2. Fall back to B列 (column index 1) of the lessonRow
+            if (!typeStr) {
+              const colBVal = lessonRow[1] !== null && lessonRow[1] !== undefined ? String(lessonRow[1]).trim() : '';
+              if (colBVal.includes('外') || colBVal.toLowerCase() === 'f' || colBVal.toLowerCase() === 'ft' || colBVal.toLowerCase() === 'w') {
+                typeStr = '外教';
+              } else if (colBVal.includes('中') || colBVal.toLowerCase() === 'c' || colBVal.toLowerCase() === 'ct' || colBVal.toLowerCase() === 'z') {
+                typeStr = '中教';
+              }
+            }
+
+            // 3. Fall back to other potential type columns if not found
+            if (!typeStr) {
               const rawTypeVal = (typeColIndex !== -1 && typeColIndex !== 1) ? lessonRow[typeColIndex] : null;
               const tempTypeStr = rawTypeVal !== null && rawTypeVal !== undefined ? String(rawTypeVal).trim() : '';
               if (tempTypeStr) {
