@@ -274,11 +274,10 @@ export default function App() {
         if (startDate && lesson.dateStr < startDate) return;
         if (endDate && lesson.dateStr > endDate) return;
 
-        // Check if there is a substitution record for this class code and date
+        // Check if there is a substitution record for this class code and date (by classCode and dateStr, case-insensitive)
         const sub = substitutionRecords.find(s => 
           s.dateStr === lesson.dateStr && 
-          s.classCode === classCode && 
-          s.originalTeacher.trim().toLowerCase() === block.teacher.trim().toLowerCase()
+          s.classCode.trim().toLowerCase() === classCode.trim().toLowerCase()
         );
 
         const actualTeacher = lesson.teacherOverride || (sub ? sub.substituteTeacher : block.teacher);
@@ -352,6 +351,31 @@ export default function App() {
     });
     return list.sort((a, b) => a.className.localeCompare(b.className));
   }, [classBlocks]);
+
+  // Classes that actually have lessons on the chosen subDate
+  const availableClassesForSubDate = useMemo(() => {
+    if (!subDate) return [];
+    
+    // Group unique classes scheduled on that day (avoid listing same class code multiple times if duplicated in blocks)
+    const list: Array<{ id: string; classCode: string; className: string; teacher: string; teacherOverride?: string }> = [];
+    const codesSeen = new Set<string>();
+
+    classBlocks.forEach(b => {
+      const lessonOnDate = b.lessons.find(l => l.dateStr === subDate);
+      if (lessonOnDate && b.classCode && !codesSeen.has(b.classCode)) {
+        codesSeen.add(b.classCode);
+        list.push({
+          id: b.id,
+          classCode: b.classCode,
+          className: b.className,
+          teacher: b.teacher,
+          teacherOverride: lessonOnDate.teacherOverride
+        });
+      }
+    });
+
+    return list.sort((a, b) => a.className.localeCompare(b.className));
+  }, [classBlocks, subDate]);
 
   // Filtered list of resolved lessons for display in the table
   const filteredResolvedLessons = useMemo(() => {
@@ -2097,7 +2121,11 @@ export default function App() {
                         <input 
                           type="date" 
                           value={subDate}
-                          onChange={(e) => setSubDate(e.target.value)}
+                          onChange={(e) => {
+                            setSubDate(e.target.value);
+                            setSubClassCode('');
+                            setSubOriginalTeacher('');
+                          }}
                           className="w-full text-xs border border-slate-200 rounded-lg px-3 py-2 outline-none focus:ring-1 focus:ring-indigo-500"
                           required
                         />
@@ -2109,20 +2137,36 @@ export default function App() {
                           value={subClassCode}
                           onChange={(e) => {
                             setSubClassCode(e.target.value);
-                            // Auto fill original teacher based on class code selection
+                            // Auto fill original teacher based on class code selection and selected date
                             const matched = classBlocks.find(b => b.classCode === e.target.value);
                             if (matched) {
-                              setSubOriginalTeacher(matched.teacher);
+                              const lessonOnDate = matched.lessons.find(l => l.dateStr === subDate);
+                              const origTeacher = lessonOnDate?.teacherOverride || matched.teacher;
+                              setSubOriginalTeacher(origTeacher);
                             }
                           }}
-                          className="w-full text-xs border border-slate-200 rounded-lg px-3 py-2 bg-white outline-none focus:ring-1 focus:ring-indigo-500"
+                          className="w-full text-xs border border-slate-200 rounded-lg px-3 py-2 bg-white outline-none focus:ring-1 focus:ring-indigo-500 disabled:bg-slate-50 disabled:text-slate-400"
                           required
+                          disabled={!subDate}
                         >
-                          <option value="">-- 选择班级 --</option>
-                          {classBlocks.map(b => (
-                            <option key={b.id} value={b.classCode}>{b.className} (原任: {b.teacher})</option>
-                          ))}
+                          <option value="">
+                            {subDate 
+                              ? (availableClassesForSubDate.length > 0 ? '-- 选择班级 --' : '-- 该日期当天无排课班级 --')
+                              : '-- 请先选择上课日期 --'
+                            }
+                          </option>
+                          {availableClassesForSubDate.map(b => {
+                            const currentTeacher = b.teacherOverride || b.teacher;
+                            return (
+                              <option key={b.id} value={b.classCode}>
+                                {b.className} (编号: {b.classCode} | 原任: {currentTeacher})
+                              </option>
+                            );
+                          })}
                         </select>
+                        {!subDate && (
+                          <p className="text-[10px] text-amber-600 mt-1">💡 请先选择上课日期，系统将自动过滤并仅显示当天有上课记录的班级列表。</p>
+                        )}
                       </div>
 
                       <div>
