@@ -1259,7 +1259,7 @@ export default function App() {
         </div>
 
         {/* METRICS & QUICK SUMMARY WIDGETS */}
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
           <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm flex flex-col justify-between h-36">
             <span className="text-sm text-slate-400 font-semibold">核算班级总数</span>
             <div>
@@ -1283,6 +1283,14 @@ export default function App() {
               <p className="text-[10px] text-slate-400 mt-1">
                 乘学生人数: {overviewStats.totalHours.toFixed(1)} / 不计人数纯课时: <strong className="text-slate-700 font-bold">{overviewStats.totalBaseHours.toFixed(1)}</strong>
               </p>
+            </div>
+          </div>
+
+          <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm flex flex-col justify-between h-36">
+            <span className="text-sm text-slate-400 font-semibold">总课销金额</span>
+            <div>
+              <div className="text-3xl font-extrabold text-emerald-600 tracking-tight">¥ {overviewStats.totalCourseDeduction.toLocaleString(undefined, {minimumFractionDigits: 1, maximumFractionDigits: 1})}</div>
+              <p className="text-[10px] text-slate-400 mt-1">结算课时 × 各教师课时费单价</p>
             </div>
           </div>
 
