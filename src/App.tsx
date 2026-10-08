@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import * as XLSX from 'xlsx';
 import { 
   Upload, 
   Calendar, 
@@ -28,7 +27,11 @@ import {
   CheckSquare
 } from 'lucide-react';
 import { ClassBlock, Student, Lesson, BonusRule, TeacherBaseRate, SubstitutionRecord, MakeupRecord, AppStateBackup } from './types';
-import { parseExcelWorkbook, calculateLessonBase, extractClassCode, detectFrequency, detectFrequencyFromLessons, isLikelyForeignTeacher } from './utils/parser';
+import { calculateLessonBase, extractClassCode, detectFrequency, detectFrequencyFromLessons, isLikelyForeignTeacher } from './utils/lessonRules';
+import { resolveLessons, calculatePayroll, collectTeacherNames } from './utils/payroll';
+import { PayrollReport } from './components/PayrollReport';
+import { applyLessonCorrection } from './utils/corrections';
+import { validateBackup, writeStorageBatch } from './utils/backup';
 
 export default function App() {
   // --- STATE ---
@@ -66,7 +69,7 @@ export default function App() {
 
   // Selection states for details viewing
   const [selectedBlockId, setSelectedBlockId] = useState<string>('');
-  const [selectedLessonIndex, setSelectedLessonIndex] = useState<number | null>(null);
+  const [selectedLessonId, setSelectedLessonId] = useState<string | null>(null);
 
   // Manual correction form states
   const [editType, setEditType] = useState<string>('');
@@ -90,7 +93,7 @@ export default function App() {
 
   // Form states for substitutions
   const [subDate, setSubDate] = useState<string>('');
-  const [subClassCode, setSubClassCode] = useState<string>('');
+  const [subLessonKey, setSubLessonKey] = useState<string>('');
   const [subOriginalTeacher, setSubOriginalTeacher] = useState<string>('');
   const [subSubstituteTeacher, setSubSubstituteTeacher] = useState<string>('');
   const [subNotes, setSubNotes] = useState<string>('');
@@ -107,35 +110,53 @@ export default function App() {
   // Feedback notifications
   const [notification, setNotification] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
 
+  const notificationTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (notificationTimer.current) clearTimeout(notificationTimer.current); }, []);
+  const importVersion = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // --- LOCAL STORAGE PERSISTENCE ---
   useEffect(() => {
-    const savedBonusRules = localStorage.getItem('course_deduction_bonus_rules');
-    const savedBaseRates = localStorage.getItem('course_deduction_base_rates');
-    const savedSubstitutions = localStorage.getItem('course_deduction_substitutions');
-    const savedMakeups = localStorage.getItem('course_deduction_makeups');
-    const savedClassBlocks = localStorage.getItem('course_deduction_class_blocks');
-    const savedFileName = localStorage.getItem('course_deduction_file_name');
-    const savedCommissionRate = localStorage.getItem('course_deduction_commission_rate');
+    const sections = [
+      ['bonusRules', 'course_deduction_bonus_rules', setBonusRules],
+      ['teacherBaseRates', 'course_deduction_base_rates', setTeacherBaseRates],
+      ['substitutionRecords', 'course_deduction_substitutions', setSubstitutionRecords],
+      ['makeupRecords', 'course_deduction_makeups', setMakeupRecords],
+      ['classBlocks', 'course_deduction_class_blocks', setClassBlocks]
+    ] as const;
+    const errors: string[] = [];
+    for (const [field, key, setter] of sections) {
+      try {
+        const raw = localStorage.getItem(key);
+        if (!raw) continue;
+        const data = validateBackup({ [field]: JSON.parse(raw) });
+        (setter as (value: any) => void)(data[field]);
+      } catch { errors.push(field); }
+    }
+    try {
+      const savedFileName = localStorage.getItem('course_deduction_file_name');
+      const savedRate = localStorage.getItem('course_deduction_commission_rate');
+      if (savedFileName) setFileName(savedFileName);
+      if (savedRate) {
+        const rate = Number(savedRate);
+        if (!Number.isFinite(rate) || rate < 0 || rate > 1) throw new Error('无效提成比例');
+        setCommissionRate(rate);
+      }
+    } catch { errors.push('基础设置'); }
+    if (errors.length) showAlert(`部分本地数据无效，已跳过：${errors.join('、')}。请从备份恢复或重新导入。`, 'error');
 
-    if (savedBonusRules) setBonusRules(JSON.parse(savedBonusRules));
-    if (savedBaseRates) setTeacherBaseRates(JSON.parse(savedBaseRates));
-    if (savedSubstitutions) setSubstitutionRecords(JSON.parse(savedSubstitutions));
-    if (savedMakeups) setMakeupRecords(JSON.parse(savedMakeups));
-    if (savedClassBlocks) setClassBlocks(JSON.parse(savedClassBlocks));
-    if (savedFileName) setFileName(savedFileName);
-    if (savedCommissionRate) setCommissionRate(parseFloat(savedCommissionRate));
   }, []);
 
-  const saveToLocalStorage = (key: string, data: any) => {
-    localStorage.setItem(key, JSON.stringify(data));
+  const saveToLocalStorage = (key: string, data: unknown): boolean => {
+    try { localStorage.setItem(key, JSON.stringify(data)); return true; }
+    catch { showAlert('保存失败，请检查浏览器存储空间。数据未更新。', 'error'); return false; }
   };
 
   // Trigger temporary alerts
   const showAlert = (message: string, type: 'success' | 'error' = 'success') => {
+    if (notificationTimer.current) clearTimeout(notificationTimer.current);
     setNotification({ message, type });
-    setTimeout(() => {
+    notificationTimer.current = setTimeout(() => {
       setNotification(null);
     }, 4000);
   };
@@ -159,45 +180,51 @@ export default function App() {
   // --- FILE HANDLING ---
   const handleFile = (file: File) => {
     if (!file) return;
+    const version = ++importVersion.current;
     const reader = new FileReader();
-    reader.onload = (e) => {
+    reader.onload = async (e) => {
       try {
         const data = new Uint8Array(e.target?.result as ArrayBuffer);
+        const [XLSX, { parseExcelWorkbook }] = await Promise.all([import('xlsx'), import('./utils/parser')]);
         const workbook = XLSX.read(data, { type: 'array' });
         const parsedBlocks = parseExcelWorkbook(workbook);
+        if (version !== importVersion.current) return;
 
         if (parsedBlocks.length === 0) {
           showAlert('没有在Excel中解析到符合格式的班级课时块，请检查文件。', 'error');
           return;
         }
 
-        setClassBlocks(parsedBlocks);
-        setFileName(file.name);
-        saveToLocalStorage('course_deduction_class_blocks', parsedBlocks);
-        saveToLocalStorage('course_deduction_file_name', file.name);
 
         // Auto initialize teacher base rates if they don't exist
         const uniqueTeachers = Array.from(new Set(parsedBlocks.map(b => b.teacher).filter(Boolean)));
         const updatedBaseRates = [...teacherBaseRates];
-        let addedCount = 0;
         uniqueTeachers.forEach(t => {
-          if (!updatedBaseRates.some(r => r.teacherName === t)) {
+          if (!updatedBaseRates.some(r => r.teacherName.trim().toLowerCase() === t.trim().toLowerCase())) {
             const detectedType = isLikelyForeignTeacher(t) ? '外教' : '中教';
             updatedBaseRates.push({ teacherName: t, baseRate: 100, teacherType: detectedType }); // Default rate 100 with auto detected type
-            addedCount++;
           }
         });
-        if (addedCount > 0) {
-          setTeacherBaseRates(updatedBaseRates);
-          saveToLocalStorage('course_deduction_base_rates', updatedBaseRates);
-        }
+        writeStorageBatch(localStorage, {
+          course_deduction_class_blocks: JSON.stringify(parsedBlocks),
+          course_deduction_file_name: file.name,
+          course_deduction_base_rates: JSON.stringify(updatedBaseRates)
+        });
+        setClassBlocks(parsedBlocks);
+        setFileName(file.name);
+        setTeacherBaseRates(updatedBaseRates);
+        setSelectedBlockId('');
+        setSelectedLessonId(null);
+        setFilterTeacher(''); setFilterClassCode('');
+        if (fileInputRef.current) fileInputRef.current.value = '';
 
         showAlert(`成功导入 ${parsedBlocks.length} 个班级，共 ${parsedBlocks.reduce((acc, b) => acc + b.lessons.length, 0)} 节上课记录！`);
       } catch (err: any) {
         console.error(err);
-        showAlert(`解析Excel失败：${err.message || '未知错误'}`, 'error');
+        showAlert(`导入失败：${err.message || '未知错误'}`, 'error');
       }
     };
+    reader.onerror = () => showAlert('读取文件失败，请重试。', 'error');
     reader.readAsArrayBuffer(file);
   };
 
@@ -224,15 +251,15 @@ export default function App() {
   };
 
   const clearImportedData = () => {
-    if (window.confirm('确定要清除所有导入的课表数据吗？您的加成和代课配置仍会保留。')) {
-      setClassBlocks([]);
-      setFileName('');
-      localStorage.removeItem('course_deduction_class_blocks');
-      localStorage.removeItem('course_deduction_file_name');
-      setSelectedBlockId('');
-      setSelectedLessonIndex(null);
+    if (!window.confirm('确定要清除所有导入的课表数据吗？您的加成和代课配置仍会保留。')) return;
+    try {
+      writeStorageBatch(localStorage, { course_deduction_class_blocks: '[]', course_deduction_file_name: '' });
+      importVersion.current++;
+      setClassBlocks([]); setFileName('');
+      setSelectedBlockId(''); setSelectedLessonId(null);
+      if (fileInputRef.current) fileInputRef.current.value = '';
       showAlert('已清空导入的课表数据');
-    }
+    } catch { showAlert('清除数据失败，请重试。', 'error'); }
   };
 
   // --- DYNAMIC DATA PROCESSING & CALCULATIONS ---
@@ -241,12 +268,12 @@ export default function App() {
   const updateClassFrequency = (blockId: string, frequency: 'once' | 'twice') => {
     const updated = classBlocks.map(b => {
       if (b.id === blockId) {
-        return { ...b, frequency };
+        return { ...b, frequency, frequencySource: 'manual' as const };
       }
       return b;
     });
+    if (!saveToLocalStorage('course_deduction_class_blocks', updated)) return;
     setClassBlocks(updated);
-    saveToLocalStorage('course_deduction_class_blocks', updated);
     showAlert('班级上课频次已手动更新');
   };
 
@@ -257,78 +284,18 @@ export default function App() {
       return;
     }
     const updated = classBlocks.map(block => {
+      if (block.frequencySource === 'manual') return block;
       const scheduleFrequency = detectFrequency(block.schedule);
-      const finalFrequency = detectFrequencyFromLessons(block.lessons, scheduleFrequency);
+      const finalFrequency = block.schedule.trim() ? scheduleFrequency : detectFrequencyFromLessons(block.lessons, scheduleFrequency);
       return { ...block, frequency: finalFrequency };
     });
+    if (!saveToLocalStorage('course_deduction_class_blocks', updated)) return;
     setClassBlocks(updated);
-    saveToLocalStorage('course_deduction_class_blocks', updated);
-    showAlert('已根据上课记录日期自动判定所有班级的上课频次！');
+    showAlert('已更新上课频次，保留明确排课和手动设置。');
   };
 
   // Resolve actual teacher and lesson details taking substitution into account
-  const resolvedLessons = useMemo(() => {
-    const list: Array<{
-      block: ClassBlock;
-      lesson: Lesson;
-      actualTeacher: string;
-      isSubstituted: boolean;
-      subRecord?: SubstitutionRecord;
-      classCode: string;
-      hours: number;
-      baseHours: number;
-      resolvedTeacherType: string;
-    }> = [];
-
-    classBlocks.forEach(block => {
-      const classCode = block.classCode;
-      
-      block.lessons.forEach(lesson => {
-        // Date filter
-        if (startDate && lesson.dateStr < startDate) return;
-        if (endDate && lesson.dateStr > endDate) return;
-
-        // Check if there is a substitution record for this class code and date (by classCode and dateStr, case-insensitive)
-        const sub = substitutionRecords.find(s => 
-          s.dateStr === lesson.dateStr && 
-          s.classCode.trim().toLowerCase() === classCode.trim().toLowerCase()
-        );
-
-        const actualTeacher = lesson.teacherOverride || (sub ? sub.substituteTeacher : block.teacher);
-        const isSubstituted = !!sub && !lesson.teacherOverride;
-
-        // Determine whether this lesson's type is Chinese or Foreign
-        const teacherConfig = teacherBaseRates.find(r => r.teacherName.trim().toLowerCase() === actualTeacher.trim().toLowerCase());
-        const isTeacherForeign = teacherConfig?.teacherType === '外教' || isLikelyForeignTeacher(actualTeacher);
-        const resolvedTeacherType = lesson.typeOverride || 
-                                     lesson.type || 
-                                     (isTeacherForeign ? '外教' : '中教');
-
-        const baseHours = lesson.baseHoursOverride !== undefined && lesson.baseHoursOverride !== null
-          ? lesson.baseHoursOverride
-          : calculateLessonBase(block.frequency, resolvedTeacherType);
-
-        const hours = lesson.hoursOverride !== undefined && lesson.hoursOverride !== null
-          ? lesson.hoursOverride
-          : lesson.attendedCount * baseHours;
-
-        list.push({
-          block,
-          lesson,
-          actualTeacher,
-          isSubstituted,
-          subRecord: sub,
-          classCode,
-          hours,
-          baseHours,
-          resolvedTeacherType
-        });
-      });
-    });
-
-    // Sort by date descending
-    return list.sort((a, b) => b.lesson.dateStr.localeCompare(a.lesson.dateStr));
-  }, [classBlocks, substitutionRecords, startDate, endDate, teacherBaseRates]);
+  const resolvedLessons = useMemo(() => resolveLessons({ classBlocks, substitutionRecords, startDate, endDate, teacherBaseRates }), [classBlocks, substitutionRecords, startDate, endDate, teacherBaseRates]);
 
   // Unique list of class codes currently imported
   const uniqueClassCodes = useMemo(() => {
@@ -340,53 +307,7 @@ export default function App() {
   }, [classBlocks]);
 
   // Unique list of teacher names currently imported or configured
-  const uniqueTeachers = useMemo(() => {
-    const namesMap = new Map<string, string>(); // lowercase -> original trimmed representation
-    
-    classBlocks.forEach(b => {
-      if (b.teacher) {
-        const trimmed = b.teacher.trim();
-        if (trimmed) {
-          namesMap.set(trimmed.toLowerCase(), trimmed);
-        }
-      }
-    });
-    
-    teacherBaseRates.forEach(r => {
-      if (r.teacherName) {
-        const trimmed = r.teacherName.trim();
-        if (trimmed) {
-          namesMap.set(trimmed.toLowerCase(), trimmed);
-        }
-      }
-    });
-    
-    substitutionRecords.forEach(s => {
-      if (s.originalTeacher) {
-        const trimmed = s.originalTeacher.trim();
-        if (trimmed) {
-          namesMap.set(trimmed.toLowerCase(), trimmed);
-        }
-      }
-      if (s.substituteTeacher) {
-        const trimmed = s.substituteTeacher.trim();
-        if (trimmed) {
-          namesMap.set(trimmed.toLowerCase(), trimmed);
-        }
-      }
-    });
-    
-    makeupRecords.forEach(m => {
-      if (m.teacherName) {
-        const trimmed = m.teacherName.trim();
-        if (trimmed) {
-          namesMap.set(trimmed.toLowerCase(), trimmed);
-        }
-      }
-    });
-    
-    return Array.from(namesMap.values());
-  }, [classBlocks, teacherBaseRates, substitutionRecords, makeupRecords]);
+  const uniqueTeachers = useMemo(() => collectTeacherNames({ classBlocks, teacherBaseRates, substitutionRecords, makeupRecords }), [classBlocks, teacherBaseRates, substitutionRecords, makeupRecords]);
 
   // Unique list of classes (code and name) currently imported
   const uniqueClassesList = useMemo(() => {
@@ -405,23 +326,14 @@ export default function App() {
   const availableClassesForSubDate = useMemo(() => {
     if (!subDate) return [];
     
-    // Group unique classes scheduled on that day (avoid listing same class code multiple times if duplicated in blocks)
-    const list: Array<{ id: string; classCode: string; className: string; teacher: string; teacherOverride?: string }> = [];
-    const codesSeen = new Set<string>();
-
-    classBlocks.forEach(b => {
-      const lessonOnDate = b.lessons.find(l => l.dateStr === subDate);
-      if (lessonOnDate && b.classCode && !codesSeen.has(b.classCode)) {
-        codesSeen.add(b.classCode);
-        list.push({
-          id: b.id,
-          classCode: b.classCode,
-          className: b.className,
-          teacher: b.teacher,
-          teacherOverride: lessonOnDate.teacherOverride
-        });
-      }
-    });
+    const list: Array<{ id: string; blockId: string; lessonId: string; classCode: string; className: string; teacher: string; teacherOverride?: string; index: number }> = [];
+    classBlocks.forEach(b => b.lessons.forEach(l => {
+      if (l.dateStr === subDate && b.classCode) list.push({
+        id: JSON.stringify([b.id, l.id]), blockId: b.id, lessonId: l.id,
+        classCode: b.classCode, className: b.className, teacher: b.teacher,
+        teacherOverride: l.teacherOverride, index: l.index
+      });
+    }));
 
     return list.sort((a, b) => a.className.localeCompare(b.className));
   }, [classBlocks, subDate]);
@@ -446,62 +358,30 @@ export default function App() {
 
   // Synchronize manual correction form states when selected lesson changes
   useEffect(() => {
-    if (selectedBlock && selectedLessonIndex !== null) {
-      const matchedLesson = selectedBlock.lessons.find(l => l.index === selectedLessonIndex);
+    if (selectedBlock && selectedLessonId !== null) {
+      const matchedLesson = selectedBlock.lessons.find(l => l.id === selectedLessonId);
       if (matchedLesson) {
         setEditType(matchedLesson.typeOverride || matchedLesson.type);
-        setEditAttendedCount(matchedLesson.attendedCount);
+        setEditAttendedCount(matchedLesson.attendedCountOverride ?? matchedLesson.attendedCount);
         setEditTeacher(matchedLesson.teacherOverride || '');
         setEditBaseHours(matchedLesson.baseHoursOverride !== undefined && matchedLesson.baseHoursOverride !== null ? String(matchedLesson.baseHoursOverride) : '');
         setEditHours(matchedLesson.hoursOverride !== undefined && matchedLesson.hoursOverride !== null ? String(matchedLesson.hoursOverride) : '');
       }
     }
-  }, [selectedBlockId, selectedLessonIndex, selectedBlock]);
+  }, [selectedBlockId, selectedLessonId, selectedBlock]);
 
   // Update a single lesson's manual overrides
-  const handleUpdateLessonOverride = (
-    blockId: string, 
-    lessonIndex: number, 
-    fields: {
-      type?: string;
-      attendedCount?: number;
-      teacherOverride?: string;
-      hoursOverride?: number | null;
-      baseHoursOverride?: number | null;
+  const handleUpdateLessonOverride = (blockId: string, lessonId: string, fields: Parameters<typeof applyLessonCorrection>[1]) => {
+    try {
+      const updated = classBlocks.map(b => b.id === blockId ? {
+        ...b, lessons: b.lessons.map(l => l.id === lessonId ? applyLessonCorrection(l, fields) : l)
+      } : b);
+      if (!saveToLocalStorage('course_deduction_class_blocks', updated)) return;
+      setClassBlocks(updated);
+      showAlert('该节课的排课记录已成功更新！');
+    } catch (error) {
+      showAlert(error instanceof Error ? error.message : '保存失败', 'error');
     }
-  ) => {
-    const updatedBlocks = classBlocks.map(b => {
-      if (b.id !== blockId) return b;
-      
-      const updatedLessons = b.lessons.map(l => {
-        if (l.index !== lessonIndex) return l;
-        
-        const newLesson = { ...l };
-        if (fields.type !== undefined) {
-          newLesson.type = fields.type;
-          newLesson.typeOverride = fields.type;
-        }
-        if (fields.attendedCount !== undefined) newLesson.attendedCount = fields.attendedCount;
-        
-        if (fields.teacherOverride !== undefined) {
-          newLesson.teacherOverride = fields.teacherOverride || undefined;
-        }
-        if (fields.hoursOverride !== undefined) {
-          newLesson.hoursOverride = fields.hoursOverride === null ? undefined : fields.hoursOverride;
-        }
-        if (fields.baseHoursOverride !== undefined) {
-          newLesson.baseHoursOverride = fields.baseHoursOverride === null ? undefined : fields.baseHoursOverride;
-        }
-        
-        return newLesson;
-      });
-      
-      return { ...b, lessons: updatedLessons };
-    });
-    
-    setClassBlocks(updatedBlocks);
-    saveToLocalStorage('course_deduction_class_blocks', updatedBlocks);
-    showAlert('该节课的排课记录已成功更新！');
   };
 
   // --- CONFIG MANAGEMENTS ---
@@ -509,13 +389,13 @@ export default function App() {
   // Add Bonus Rule
   const handleAddBonusRule = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newRuleTeacher || !newRuleClassCode || !newRuleBonusRate) {
+    if (!newRuleTeacher.trim() || !newRuleClassCode.trim() || !newRuleBonusRate) {
       showAlert('请填完整加成规则信息！', 'error');
       return;
     }
 
     const rate = parseFloat(newRuleBonusRate);
-    if (isNaN(rate) || rate < 0) {
+    if (!Number.isFinite(rate) || rate < 0) {
       showAlert('加成单价必须为正数！', 'error');
       return;
     }
@@ -532,7 +412,7 @@ export default function App() {
     }
 
     const newRule: BonusRule = {
-      id: `rule_${Date.now()}`,
+      id: crypto.randomUUID(),
       teacherName: newRuleTeacher.trim(),
       classCode: newRuleClassCode.trim(),
       bonusRate: rate,
@@ -541,8 +421,8 @@ export default function App() {
     };
 
     const updated = [...bonusRules, newRule];
+    if (!saveToLocalStorage('course_deduction_bonus_rules', updated)) return;
     setBonusRules(updated);
-    saveToLocalStorage('course_deduction_bonus_rules', updated);
 
     // Clear form
     setNewRuleBonusRate('');
@@ -553,21 +433,21 @@ export default function App() {
 
   const handleDeleteBonusRule = (id: string) => {
     const updated = bonusRules.filter(r => r.id !== id);
+    if (!saveToLocalStorage('course_deduction_bonus_rules', updated)) return;
     setBonusRules(updated);
-    saveToLocalStorage('course_deduction_bonus_rules', updated);
     showAlert('加成规则已删除');
   };
 
   // Update/Add Teacher Base Rate
   const handleAddTeacherRate = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newTeacherName || !newTeacherBaseRate) {
+    if (!newTeacherName.trim() || !newTeacherBaseRate) {
       showAlert('请填完整教师单价信息！', 'error');
       return;
     }
 
     const rate = parseFloat(newTeacherBaseRate);
-    if (isNaN(rate) || rate < 0) {
+    if (!Number.isFinite(rate) || rate < 0) {
       showAlert('基础单价必须为正数！', 'error');
       return;
     }
@@ -576,9 +456,7 @@ export default function App() {
     const index = updated.findIndex(r => r.teacherName.trim().toLowerCase() === newTeacherName.trim().toLowerCase());
 
     if (index !== -1) {
-      updated[index].baseRate = rate;
-      updated[index].teacherType = newTeacherType;
-      updated[index].commissionRate = newTeacherCommissionRate;
+      updated[index] = { ...updated[index], baseRate: rate, teacherType: newTeacherType, commissionRate: newTeacherCommissionRate };
     } else {
       updated.push({ 
         teacherName: newTeacherName.trim(), 
@@ -588,12 +466,12 @@ export default function App() {
       });
     }
 
+    if (!saveToLocalStorage('course_deduction_base_rates', updated)) return;
     setTeacherBaseRates(updated);
-    saveToLocalStorage('course_deduction_base_rates', updated);
 
     setNewTeacherName('');
     setNewTeacherBaseRate('');
-    setNewTeacherType('colleagues' as any === 'colleagues' ? '中教' : '外教');
+    setNewTeacherType('中教');
     setNewTeacherCommissionRate(0.07);
     showAlert('成功更新教师基础课时与提成配置！');
   };
@@ -606,8 +484,8 @@ export default function App() {
       }
       return r;
     });
+    if (!saveToLocalStorage('course_deduction_base_rates', updated)) return;
     setTeacherBaseRates(updated);
-    saveToLocalStorage('course_deduction_base_rates', updated);
     showAlert(`已成功将教师 ${teacherName} 的属性切换为 [${updated.find(r => r.teacherName.trim().toLowerCase() === teacherName.trim().toLowerCase())?.teacherType || '中教'}]！`);
   };
 
@@ -618,22 +496,22 @@ export default function App() {
       }
       return r;
     });
+    if (!saveToLocalStorage('course_deduction_base_rates', updated)) return;
     setTeacherBaseRates(updated);
-    saveToLocalStorage('course_deduction_base_rates', updated);
     showAlert(`已成功将教师 ${teacherName} 的专属提成比例修改为 ${(rate * 100).toFixed(0)}%！`);
   };
 
   const handleDeleteTeacherRate = (teacherName: string) => {
     const updated = teacherBaseRates.filter(r => r.teacherName !== teacherName);
+    if (!saveToLocalStorage('course_deduction_base_rates', updated)) return;
     setTeacherBaseRates(updated);
-    saveToLocalStorage('course_deduction_base_rates', updated);
     showAlert('教师课时单价配置已清除');
   };
 
   // Add Substitution Record
   const handleAddSubstitution = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!subDate || !subClassCode || !subOriginalTeacher || !subSubstituteTeacher) {
+    if (!subDate || !subLessonKey || !subOriginalTeacher || !subSubstituteTeacher.trim()) {
       showAlert('请填写完整的代课记录信息！', 'error');
       return;
     }
@@ -643,27 +521,26 @@ export default function App() {
       return;
     }
 
-    // Find full name of class if available for display
-    const matchedClass = classBlocks.find(b => b.classCode === subClassCode);
-    const className = matchedClass ? matchedClass.className : `班级(${subClassCode})`;
-
+    const selected = availableClassesForSubDate.find(c => c.id === subLessonKey);
+    if (!selected) { showAlert('请选择有效的上课记录', 'error'); return; }
+    if (selected.teacherOverride) { showAlert('该节课已手动修正授课老师，请先恢复默认后再录入代课。', 'error'); return; }
+    const duplicate = substitutionRecords.some(r => r.dateStr === subDate &&
+      (r.blockId ? r.blockId === selected.blockId : r.classCode === selected.classCode && r.originalTeacher.trim().toLowerCase() === selected.teacher.trim().toLowerCase()) &&
+      (!r.lessonId || r.lessonId === selected.lessonId));
+    if (duplicate) { showAlert('该节课已有代课记录，请先删除旧记录再重新录入。', 'error'); return; }
     const record: SubstitutionRecord = {
-      id: `sub_${Date.now()}`,
-      dateStr: subDate,
-      classCode: subClassCode,
-      className,
-      originalTeacher: subOriginalTeacher.trim(),
-      substituteTeacher: subSubstituteTeacher.trim(),
-      notes: subNotes.trim()
+      id: crypto.randomUUID(), blockId: selected.blockId, lessonId: selected.lessonId,
+      dateStr: subDate, classCode: selected.classCode, className: selected.className,
+      originalTeacher: selected.teacher, substituteTeacher: subSubstituteTeacher.trim(), notes: subNotes.trim()
     };
 
     const updated = [...substitutionRecords, record];
+    if (!saveToLocalStorage('course_deduction_substitutions', updated)) return;
     setSubstitutionRecords(updated);
-    saveToLocalStorage('course_deduction_substitutions', updated);
 
     // Clear form
     setSubDate('');
-    setSubClassCode('');
+    setSubLessonKey('');
     setSubOriginalTeacher('');
     setSubSubstituteTeacher('');
     setSubNotes('');
@@ -672,27 +549,27 @@ export default function App() {
 
   const handleDeleteSubstitution = (id: string) => {
     const updated = substitutionRecords.filter(s => s.id !== id);
+    if (!saveToLocalStorage('course_deduction_substitutions', updated)) return;
     setSubstitutionRecords(updated);
-    saveToLocalStorage('course_deduction_substitutions', updated);
     showAlert('代课记录已删除，薪资自动恢复');
   };
 
   // Add Makeup Record
   const handleAddMakeup = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!makeupDate || !makeupTeacher || !makeupHours) {
+    if (!makeupDate || !makeupTeacher.trim() || !makeupHours) {
       showAlert('请填写完整的补课记录信息！', 'error');
       return;
     }
 
     const hoursNum = parseFloat(makeupHours);
-    if (isNaN(hoursNum) || hoursNum <= 0) {
+    if (!Number.isFinite(hoursNum) || hoursNum <= 0) {
       showAlert('请输入有效的补课课时数量！', 'error');
       return;
     }
 
     const record: MakeupRecord = {
-      id: `makeup_${Date.now()}`,
+      id: crypto.randomUUID(),
       dateStr: makeupDate,
       teacherName: makeupTeacher.trim(),
       hours: hoursNum,
@@ -700,8 +577,8 @@ export default function App() {
     };
 
     const updated = [...makeupRecords, record];
+    if (!saveToLocalStorage('course_deduction_makeups', updated)) return;
     setMakeupRecords(updated);
-    saveToLocalStorage('course_deduction_makeups', updated);
 
     // Clear form
     setMakeupDate('');
@@ -713,8 +590,8 @@ export default function App() {
 
   const handleDeleteMakeup = (id: string) => {
     const updated = makeupRecords.filter(m => m.id !== id);
+    if (!saveToLocalStorage('course_deduction_makeups', updated)) return;
     setMakeupRecords(updated);
-    saveToLocalStorage('course_deduction_makeups', updated);
     showAlert('补课记录已删除，对应课销已扣除');
   };
 
@@ -755,6 +632,7 @@ export default function App() {
   // --- BACKUP & RESTORE ---
   const handleBackupExport = () => {
     const backup: AppStateBackup = {
+      version: 2, classBlocks, fileName, commissionRate,
       bonusRules,
       teacherBaseRates,
       substitutionRecords,
@@ -777,195 +655,57 @@ export default function App() {
     const reader = new FileReader();
     reader.onload = (event) => {
       try {
-        const backup: AppStateBackup = JSON.parse(event.target?.result as string);
-        if (!backup.bonusRules && !backup.teacherBaseRates && !backup.substitutionRecords && !backup.makeupRecords) {
-          showAlert('无效的备份文件，未检测到支持的配置类型。', 'error');
-          return;
-        }
+        const backup = validateBackup(JSON.parse(event.target?.result as string));
+        const keys = {
+          bonusRules: 'course_deduction_bonus_rules', teacherBaseRates: 'course_deduction_base_rates',
+          substitutionRecords: 'course_deduction_substitutions', makeupRecords: 'course_deduction_makeups',
+          classBlocks: 'course_deduction_class_blocks', fileName: 'course_deduction_file_name',
+          commissionRate: 'course_deduction_commission_rate'
+        };
+        const entries: Record<string, string> = {};
+        Object.entries(keys).forEach(([field, key]) => {
+          if (backup[field] !== undefined) entries[key] = field === 'fileName' || field === 'commissionRate' ? String(backup[field]) : JSON.stringify(backup[field]);
+        });
+        writeStorageBatch(localStorage, entries);
+        if (backup.bonusRules) setBonusRules(backup.bonusRules);
+        if (backup.teacherBaseRates) setTeacherBaseRates(backup.teacherBaseRates);
+        if (backup.substitutionRecords) setSubstitutionRecords(backup.substitutionRecords);
+        if (backup.makeupRecords) setMakeupRecords(backup.makeupRecords);
+        if (backup.classBlocks) { setClassBlocks(backup.classBlocks); setSelectedBlockId(''); setSelectedLessonId(null); }
+        if (backup.fileName !== undefined) setFileName(backup.fileName);
+        if (backup.commissionRate !== undefined) setCommissionRate(backup.commissionRate);
 
-        if (backup.bonusRules) {
-          setBonusRules(backup.bonusRules);
-          saveToLocalStorage('course_deduction_bonus_rules', backup.bonusRules);
-        }
-        if (backup.teacherBaseRates) {
-          setTeacherBaseRates(backup.teacherBaseRates);
-          saveToLocalStorage('course_deduction_base_rates', backup.teacherBaseRates);
-        }
-        if (backup.substitutionRecords) {
-          setSubstitutionRecords(backup.substitutionRecords);
-          saveToLocalStorage('course_deduction_substitutions', backup.substitutionRecords);
-        }
-        if (backup.makeupRecords) {
-          setMakeupRecords(backup.makeupRecords);
-          saveToLocalStorage('course_deduction_makeups', backup.makeupRecords);
-        } else {
-          setMakeupRecords([]);
-          saveToLocalStorage('course_deduction_makeups', []);
-        }
-
-        showAlert('配置备份成功导入！所有课时费加成、教师单价及代课/补课记录已恢复。');
+        showAlert('备份中包含的数据已恢复，未包含的数据保持不变。');
         // Reset file input
         e.target.value = '';
       } catch (err) {
-        showAlert('解析备份文件失败，请确认文件格式正确。', 'error');
+        showAlert(err instanceof Error ? `恢复失败：${err.message}` : '恢复失败，请检查备份文件。', 'error');
       }
     };
     reader.readAsText(file);
   };
 
+  const handleCommissionRateChange = (rate: number) => {
+    try {
+      localStorage.setItem('course_deduction_commission_rate', String(rate));
+      setCommissionRate(rate);
+      showAlert(`提成比例已切换为 ${(rate * 100).toFixed(0)}%`);
+    } catch { showAlert('设置保存失败，请检查浏览器存储空间。', 'error'); }
+  };
+
+  const handleTeacherCommissionRateChange = (teacherName: string, rate: number) => {
+    const existing = teacherBaseRates.find(r => r.teacherName.trim().toLowerCase() === teacherName.trim().toLowerCase());
+    if (existing) { updateTeacherCommissionRate(existing.teacherName, rate); return; }
+    const updated = [...teacherBaseRates, { teacherName, baseRate: 100, commissionRate: rate }];
+    try {
+      if (!saveToLocalStorage('course_deduction_base_rates', updated)) return;
+      setTeacherBaseRates(updated);
+      showAlert(`已为 ${teacherName} 设置提成比例为 ${(rate * 100).toFixed(0)}%`);
+    } catch { showAlert('设置保存失败，请检查浏览器存储空间。', 'error'); }
+  };
+
   // --- REPORT GENERATION ---
-  const teacherReportData = useMemo(() => {
-    const report: { [teacherName: string]: {
-      teacherName: string;
-      baseRate: number;
-      sessionsCount: number;
-      baseHours: number; // Taught normal class hours
-      baseClassHours: number; // Taught normal class hours (without student count)
-      substitutedOutHours: number; // Substituted by others (deducted)
-      substitutedOutClassHours: number; // Substituted by others (deducted, without student count)
-      substitutedInHours: number; // Substituting for others (added)
-      substitutedInClassHours: number; // Substituting for others (added, without student count)
-      makeupHours: number; // Makeup lesson hours added
-      settlementHours: number; // Final credited hours: base - out + in + makeup
-      settlementClassHours: number; // Final credited hours: base - out + in + makeup (without student count)
-      bonusHours: number; // Hours eligible for bonus
-      bonusAmount: number; // Total bonus money
-      baseSalary: number; // settlementHours * baseRate (Total Course Deduction Value)
-      commissionAmount: number; // baseSalary * commissionRate (Teacher's commission from course deduction)
-      totalSalary: number; // commissionAmount + bonusAmount (Actual take-home lesson salary)
-      substitutionDetails: string[];
-      makeupDetails: string[];
-    }} = {};
-
-    // Initialize report structure for all unique teachers
-    uniqueTeachers.forEach(tName => {
-      const baseRateObj = teacherBaseRates.find(r => r.teacherName.trim().toLowerCase() === tName.trim().toLowerCase());
-      report[tName] = {
-        teacherName: tName,
-        baseRate: baseRateObj ? baseRateObj.baseRate : 100, // Default 100
-        sessionsCount: 0,
-        baseHours: 0,
-        baseClassHours: 0,
-        substitutedOutHours: 0,
-        substitutedOutClassHours: 0,
-        substitutedInHours: 0,
-        substitutedInClassHours: 0,
-        makeupHours: 0,
-        settlementHours: 0,
-        settlementClassHours: 0,
-        bonusHours: 0,
-        bonusAmount: 0,
-        baseSalary: 0,
-        commissionAmount: 0,
-        totalSalary: 0,
-        substitutionDetails: [],
-        makeupDetails: []
-      };
-    });
-
-    // Helper to find report entry case-insensitively and with trimming
-    const findReportEntry = (name: string) => {
-      if (!name) return null;
-      const cleanName = name.trim().toLowerCase();
-      const matchingKey = Object.keys(report).find(k => k.trim().toLowerCase() === cleanName);
-      return matchingKey ? report[matchingKey] : null;
-    };
-
-    // Go through all resolved lessons in the filtered date range
-    resolvedLessons.forEach(item => {
-      const origTeacher = item.block.teacher;
-      const actTeacher = item.actualTeacher;
-      const hours = item.hours;
-      const baseHours = item.baseHours;
-      const classCode = item.classCode;
-      const date = item.lesson.dateStr;
-
-      const origReport = findReportEntry(origTeacher);
-      const actReport = findReportEntry(actTeacher);
-
-      // 1. Taught sessions & Base Hours tracking
-      if (origReport) {
-        origReport.baseHours += hours;
-        origReport.baseClassHours += baseHours;
-      }
-
-      if (item.isSubstituted) {
-        // Original teacher is substituted OUT
-        if (origReport) {
-          origReport.substitutedOutHours += hours;
-          origReport.substitutedOutClassHours += baseHours;
-          origReport.substitutionDetails.push(
-            `[-] ${date} 由 [${actTeacher}] 代课 ${item.block.className} (${hours} 课时 / 纯课时:${baseHours})`
-          );
-        }
-        // Substitute teacher is substituted IN
-        if (actReport) {
-          actReport.substitutedInHours += hours;
-          actReport.substitutedInClassHours += baseHours;
-          actReport.sessionsCount += 1;
-          actReport.substitutionDetails.push(
-            `[+] ${date} 代替 [${origTeacher}] 授课 ${item.block.className} (${hours} 课时 / 纯课时:${baseHours})`
-          );
-        }
-      } else {
-        // Taught by original teacher
-        if (actReport) {
-          actReport.sessionsCount += 1;
-        }
-      }
-
-      // 2. Bonus calculation
-      // Bonus goes to the actual teacher who taught, provided they have a bonus rule for this class code
-      const rule = bonusRules.find(r => 
-        r.teacherName.trim().toLowerCase() === actTeacher.trim().toLowerCase() && 
-        r.classCode.trim().toLowerCase() === classCode.trim().toLowerCase()
-      );
-
-      if (rule && actReport) {
-        // If the rule specifies a start date, only apply the bonus if the lesson date is >= the start date
-        const isEligible = !rule.startDate || date >= rule.startDate;
-        if (isEligible) {
-          const bonusPay = baseHours * rule.bonusRate;
-          actReport.bonusHours += baseHours;
-          actReport.bonusAmount += bonusPay;
-        }
-      }
-    });
-
-    // 3. Sum up makeups for each teacher
-    const activeMakeups = makeupRecords.filter(m => {
-      if (startDate && m.dateStr < startDate) return false;
-      if (endDate && m.dateStr > endDate) return false;
-      return true;
-    });
-
-    activeMakeups.forEach(m => {
-      const tName = m.teacherName;
-      const mReport = findReportEntry(tName);
-      if (mReport) {
-        mReport.makeupHours += m.hours;
-        mReport.sessionsCount += 1;
-        mReport.makeupDetails.push(
-          `${m.dateStr} 补课: +${m.hours} 课时${m.notes ? ` (${m.notes})` : ''}`
-        );
-      }
-    });
-
-    // Final mathematical summaries for each teacher
-    Object.keys(report).forEach(tName => {
-      const data = report[tName];
-      const baseRateObj = teacherBaseRates.find(r => r.teacherName.trim().toLowerCase() === tName.trim().toLowerCase());
-      const rateOfCommission = (baseRateObj && baseRateObj.commissionRate !== undefined) ? baseRateObj.commissionRate : commissionRate;
-
-      data.settlementHours = data.baseHours - data.substitutedOutHours + data.substitutedInHours + data.makeupHours;
-      data.settlementClassHours = data.baseClassHours - data.substitutedOutClassHours + data.substitutedInClassHours + data.makeupHours;
-      data.baseSalary = data.settlementHours * data.baseRate;
-      data.commissionAmount = data.baseSalary * rateOfCommission;
-      data.totalSalary = data.commissionAmount + data.bonusAmount;
-    });
-
-    return Object.values(report).sort((a, b) => b.totalSalary - a.totalSalary);
-  }, [resolvedLessons, teacherBaseRates, bonusRules, makeupRecords, uniqueTeachers, startDate, endDate, commissionRate]);
+  const teacherReportData = useMemo(() => calculatePayroll({ resolvedLessons, teacherBaseRates, bonusRules, makeupRecords, uniqueTeachers, startDate, endDate, commissionRate }), [resolvedLessons, teacherBaseRates, bonusRules, makeupRecords, uniqueTeachers, startDate, endDate, commissionRate]);
 
   // Overall KPI summaries
   const overviewStats = useMemo(() => {
@@ -1079,6 +819,7 @@ export default function App() {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
   return (
@@ -1518,10 +1259,12 @@ export default function App() {
                                   r.teacherName.trim().toLowerCase() === item.actualTeacher.trim().toLowerCase() && 
                                   r.classCode === item.classCode
                                 );
-                                const isSelected = selectedBlockId === item.block.id && selectedLessonIndex === item.lesson.index;
+                                const isSelected = selectedBlockId === item.block.id && selectedLessonId === item.lesson.id;
                                 const isOverridden = !!item.lesson.teacherOverride || 
                                                      item.lesson.hoursOverride !== undefined || 
-                                                     item.lesson.baseHoursOverride !== undefined;
+                                                     item.lesson.baseHoursOverride !== undefined ||
+                                                     item.lesson.typeOverride !== undefined ||
+                                                     item.lesson.attendedCountOverride !== undefined;
                                 
                                 return (
                                   <tr 
@@ -1569,7 +1312,7 @@ export default function App() {
                                       </select>
                                     </td>
                                     <td className="px-3 py-3 text-center font-medium font-mono">
-                                      {item.lesson.attendedCount} <span className="text-xs text-slate-400">/ {item.lesson.totalStudents}</span>
+                                      {item.lesson.attendedCountOverride ?? item.lesson.attendedCount} <span className="text-xs text-slate-400">/ {item.lesson.totalStudents}</span>
                                     </td>
                                     <td className="px-3 py-3 text-right font-medium text-indigo-600 font-mono">
                                       {item.baseHours.toFixed(1)}
@@ -1591,7 +1334,7 @@ export default function App() {
                                       <button
                                         onClick={() => {
                                           setSelectedBlockId(item.block.id);
-                                          setSelectedLessonIndex(item.lesson.index);
+                                          setSelectedLessonId(item.lesson.id);
                                         }}
                                         className="inline-flex items-center gap-1 text-xs text-indigo-600 hover:text-indigo-800 font-medium cursor-pointer"
                                       >
@@ -1610,13 +1353,15 @@ export default function App() {
 
                     {/* ATTENDANCE SIDE DETAIL PANEL */}
                     <div className="xl:col-span-4 space-y-4">
-                      {selectedBlock && selectedLessonIndex !== null ? (
+                      {selectedBlock && selectedLessonId !== null ? (
                         (() => {
-                          const matchedLesson = selectedBlock.lessons.find(l => l.index === selectedLessonIndex);
+                          const matchedLesson = selectedBlock.lessons.find(l => l.id === selectedLessonId);
                           if (!matchedLesson) return null;
 
-                          const resolvedItem = resolvedLessons.find(item => item.block.id === selectedBlock.id && item.lesson.index === selectedLessonIndex);
+                          const resolvedItem = resolvedLessons.find(item => item.block.id === selectedBlock.id && item.lesson.id === selectedLessonId);
                           const currentResolvedType = resolvedItem?.resolvedTeacherType || matchedLesson.type;
+                          const currentBaseHours = resolvedItem?.baseHours ?? calculateLessonBase(selectedBlock.frequency, currentResolvedType);
+                          const currentHours = resolvedItem?.hours ?? (matchedLesson.attendedCountOverride ?? matchedLesson.attendedCount) * currentBaseHours;
 
                           return (
                             <div className="bg-white border border-slate-200/80 rounded-2xl p-6 shadow-sm space-y-5 sticky top-24 animate-in fade-in duration-200">
@@ -1631,7 +1376,7 @@ export default function App() {
                                 <button 
                                   onClick={() => {
                                     setSelectedBlockId('');
-                                    setSelectedLessonIndex(null);
+                                    setSelectedLessonId(null);
                                   }}
                                   className="p-1 rounded-lg text-slate-400 hover:bg-slate-50 transition cursor-pointer"
                                 >
@@ -1691,8 +1436,8 @@ export default function App() {
                                   换算课时公式
                                 </div>
                                 <p>
-                                  参课人数 ({matchedLesson.attendedCount}人) × 课时基数 ({calculateLessonBase(selectedBlock.frequency, currentResolvedType)}小时/课) = 
-                                  <strong className="text-indigo-600 ml-1">{(matchedLesson.attendedCount * calculateLessonBase(selectedBlock.frequency, currentResolvedType)).toFixed(1)} 课时</strong>。
+                                  {matchedLesson.hoursOverride !== undefined ? '手动结算课时：' : <>参课人数 ({matchedLesson.attendedCountOverride ?? matchedLesson.attendedCount}人) × 课时基数 ({currentBaseHours}小时/课) = </>}
+                                  <strong className="text-indigo-600 ml-1">{currentHours.toFixed(1)} 课时</strong>。
                                 </p>
                               </div>
 
@@ -1711,6 +1456,7 @@ export default function App() {
                                       onChange={(e) => setEditType(e.target.value)}
                                       className="w-full bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-xl px-2 py-1 text-slate-700 outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 transition cursor-pointer"
                                     >
+                                      <option value="">使用导入课型或教师设置</option>
                                       <option value="中教">中教课</option>
                                       <option value="外教">外教课</option>
                                     </select>
@@ -1790,7 +1536,7 @@ export default function App() {
                                 <div className="flex gap-2 pt-1">
                                   <button
                                     onClick={() => {
-                                      handleUpdateLessonOverride(selectedBlock.id, matchedLesson.index, {
+                                      handleUpdateLessonOverride(selectedBlock.id, matchedLesson.id, {
                                         type: editType,
                                         attendedCount: Number(editAttendedCount),
                                         teacherOverride: editTeacher === '__custom__' ? '' : editTeacher,
@@ -1805,11 +1551,8 @@ export default function App() {
                                   <button
                                     onClick={() => {
                                       // Clear manual overrides
-                                      handleUpdateLessonOverride(selectedBlock.id, matchedLesson.index, {
-                                        type: undefined,
-                                        teacherOverride: '',
-                                        hoursOverride: null,
-                                        baseHoursOverride: null
+                                      handleUpdateLessonOverride(selectedBlock.id, matchedLesson.id, {
+                                        reset: true
                                       });
                                       // Restore local states to default parsed values
                                       setEditType(matchedLesson.type);
@@ -2219,7 +1962,7 @@ export default function App() {
                           value={subDate}
                           onChange={(e) => {
                             setSubDate(e.target.value);
-                            setSubClassCode('');
+                            setSubLessonKey('');
                             setSubOriginalTeacher('');
                           }}
                           className="w-full text-xs border border-slate-200 rounded-lg px-3 py-2 outline-none focus:ring-1 focus:ring-indigo-500"
@@ -2230,16 +1973,11 @@ export default function App() {
                       <div>
                         <label className="block text-xs font-semibold text-slate-600 mb-1">代课的班级编号</label>
                         <select
-                          value={subClassCode}
+                          value={subLessonKey}
                           onChange={(e) => {
-                            setSubClassCode(e.target.value);
-                            // Auto fill original teacher based on class code selection and selected date
-                            const matched = classBlocks.find(b => b.classCode === e.target.value);
-                            if (matched) {
-                              const lessonOnDate = matched.lessons.find(l => l.dateStr === subDate);
-                              const origTeacher = lessonOnDate?.teacherOverride || matched.teacher;
-                              setSubOriginalTeacher(origTeacher);
-                            }
+                            setSubLessonKey(e.target.value);
+                            const matched = availableClassesForSubDate.find(b => b.id === e.target.value);
+                            setSubOriginalTeacher(matched?.teacher || '');
                           }}
                           className="w-full text-xs border border-slate-200 rounded-lg px-3 py-2 bg-white outline-none focus:ring-1 focus:ring-indigo-500 disabled:bg-slate-50 disabled:text-slate-400"
                           required
@@ -2254,8 +1992,8 @@ export default function App() {
                           {availableClassesForSubDate.map(b => {
                             const currentTeacher = b.teacherOverride || b.teacher;
                             return (
-                              <option key={b.id} value={b.classCode}>
-                                {b.className} (编号: {b.classCode} | 原任: {currentTeacher})
+                              <option key={b.id} value={b.id}>
+                                {b.className} (原任: {currentTeacher} | 第 {b.index} 次课)
                               </option>
                             );
                           })}
@@ -2271,7 +2009,7 @@ export default function App() {
                           type="text" 
                           placeholder="原班主任教师"
                           value={subOriginalTeacher}
-                          onChange={(e) => setSubOriginalTeacher(e.target.value)}
+                          readOnly
                           className="w-full text-xs border border-slate-200 rounded-lg px-3 py-2 outline-none focus:ring-1 focus:ring-indigo-500"
                           required
                         />
@@ -2521,196 +2259,10 @@ export default function App() {
 
             {/* TAB 4: PAYROLL REPORT */}
             {activeTab === 'report' && (
-              <div className="space-y-6">
-                
-                {/* PAYROLL ACTIONS & TITLE */}
-                <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4 border-b border-slate-100 pb-4">
-                  <div>
-                    <h3 className="text-lg font-bold text-slate-900">月度课消提成与薪资汇总表</h3>
-                    <p className="text-xs text-slate-500 mt-1">
-                      包含教师基础单价、符合筛选时间的扣减对换及特定加成之后的最终核算薪资
-                    </p>
-                  </div>
-                  <div className="flex flex-wrap items-center gap-3">
-                    <div className="flex items-center gap-2 bg-slate-50 border border-slate-200 rounded-lg px-3 py-1.5 shadow-sm">
-                      <span className="text-xs font-bold text-slate-600">提成比例：</span>
-                      <select
-                        id="commission-rate-select"
-                        value={commissionRate}
-                        onChange={(e) => {
-                          const val = parseFloat(e.target.value);
-                          setCommissionRate(val);
-                          localStorage.setItem('course_deduction_commission_rate', String(val));
-                          showAlert(`提成比例已切换为 ${(val * 100).toFixed(0)}%`);
-                        }}
-                        className="text-xs font-bold text-indigo-600 bg-transparent outline-none border-none cursor-pointer focus:ring-0 p-0"
-                      >
-                        <option value={0.07}>7% (默认)</option>
-                        <option value={0.06}>6%</option>
-                      </select>
-                    </div>
-
-                    <button
-                      id="export-csv-btn"
-                      onClick={handleExportCSV}
-                      className="inline-flex items-center gap-2 px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shadow-md shadow-indigo-100 transition cursor-pointer"
-                    >
-                      <Download className="w-4 h-4" />
-                      一键导出薪资结算表 (.csv)
-                    </button>
-                  </div>
-                </div>
-
-                {classBlocks.length === 0 ? (
-                  <div className="py-12 flex flex-col items-center justify-center text-center space-y-3">
-                    <div className="bg-slate-100 p-4 rounded-full text-slate-400">
-                      <FileSpreadsheet className="w-8 h-8" />
-                    </div>
-                    <div className="space-y-1">
-                      <h4 className="text-sm font-semibold text-slate-800">未检测到任何数据</h4>
-                      <p className="text-xs text-slate-400">请导入 Excel 考勤课时后查看报表。</p>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="space-y-6">
-                    
-                    {/* SUMMARY PAYROLL TABLE */}
-                    <div className="overflow-x-auto border border-slate-200 rounded-xl bg-white shadow-sm">
-                      <table className="w-full text-left border-collapse">
-                        <thead>
-                          <tr className="bg-slate-50 border-b border-slate-200 text-slate-400 font-semibold text-xs whitespace-nowrap">
-                            <th className="px-4 py-3.5">老师姓名</th>
-                            <th className="px-4 py-3.5 text-right">课消基础单价</th>
-                            <th className="px-4 py-3.5 text-center">授课总次数</th>
-                            <th className="px-4 py-3.5 text-right">名下班级课时<span className="text-[10px] text-slate-400 block font-normal">(乘人数)</span></th>
-                            <th className="px-4 py-3.5 text-right text-indigo-500">名下班级纯课时<span className="text-[10px] text-indigo-400 block font-normal">(不计人数)</span></th>
-                            <th className="px-4 py-3.5 text-right text-rose-600">代出课时(-)<span className="text-[10px] text-rose-400 block font-normal">(乘人数)</span></th>
-                            <th className="px-4 py-3.5 text-right text-emerald-600">代入课时(+)<span className="text-[10px] text-emerald-400 block font-normal">(乘人数)</span></th>
-                            <th className="px-4 py-3.5 text-right text-indigo-500">补课课销(+)<span className="text-[10px] text-indigo-400 block font-normal">(不计人数)</span></th>
-                            <th className="px-4 py-3.5 text-right font-bold text-slate-900 bg-slate-50/50">总结算课时<span className="text-[10px] text-slate-500 block font-normal">(乘人数)</span></th>
-                            <th className="px-4 py-3.5 text-right font-bold text-indigo-600 bg-indigo-50/30">总结算纯课时<span className="text-[10px] text-indigo-500 block font-normal">(不计人数)</span></th>
-                            <th className="px-4 py-3.5 text-right text-indigo-600">加成课时</th>
-                            <th className="px-4 py-3.5 text-right text-indigo-600">加成提成累计<span className="text-[10px] text-indigo-400 block font-normal">(不计人数)</span></th>
-                            <th className="px-4 py-3.5 text-right font-bold text-slate-900 bg-slate-50/55">总课销金额<span className="text-[10px] text-slate-500 block font-normal">(应结课销)</span></th>
-                            <th className="px-4 py-3.5 text-right font-bold text-indigo-600 bg-indigo-50/20">课销提成<span className="text-[10px] text-indigo-500 block font-normal">(切换比例)</span></th>
-                            <th className="px-4 py-3.5 text-right font-bold text-slate-950 bg-indigo-50/10">老师实际到手薪资</th>
-                            <th className="px-4 py-3.5 text-center">代/补课明细</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-100 text-sm text-slate-700">
-                          {teacherReportData.map((t) => {
-                            return (
-                              <tr key={t.teacherName} className="hover:bg-slate-50/60 transition-colors">
-                                <td className="px-4 py-3.5 font-bold text-slate-800">{t.teacherName}</td>
-                                <td className="px-4 py-3.5 text-right font-mono">¥ {t.baseRate} <span className="text-[10px] text-slate-400">/课时</span></td>
-                                <td className="px-4 py-3.5 text-center font-mono font-medium">{t.sessionsCount} <span className="text-xs text-slate-400">次</span></td>
-                                <td className="px-4 py-3.5 text-right font-mono">{t.baseHours.toFixed(1)}</td>
-                                <td className="px-4 py-3.5 text-right font-mono text-indigo-500">{t.baseClassHours.toFixed(1)}</td>
-                                <td className="px-4 py-3.5 text-right font-mono text-rose-600">
-                                  {t.substitutedOutHours > 0 ? `-${t.substitutedOutHours.toFixed(1)}` : '0.0'}
-                                </td>
-                                <td className="px-4 py-3.5 text-right font-mono text-emerald-600">
-                                  {t.substitutedInHours > 0 ? `+${t.substitutedInHours.toFixed(1)}` : '0.0'}
-                                </td>
-                                <td className="px-4 py-3.5 text-right font-mono text-indigo-600">
-                                  {t.makeupHours > 0 ? `+${t.makeupHours.toFixed(1)}` : '0.0'}
-                                </td>
-                                <td className="px-4 py-3.5 text-right font-bold font-mono text-slate-900 bg-slate-50/50">{t.settlementHours.toFixed(1)}</td>
-                                <td className="px-4 py-3.5 text-right font-bold font-mono text-indigo-600 bg-indigo-50/30">{t.settlementClassHours.toFixed(1)}</td>
-                                <td className="px-4 py-3.5 text-right font-mono text-indigo-600">{t.bonusHours.toFixed(1)}</td>
-                                <td className="px-4 py-3.5 text-right font-bold font-mono text-indigo-600">¥ {t.bonusAmount.toFixed(1)}</td>
-                                <td className="px-4 py-3.5 text-right font-bold font-mono text-slate-900 bg-slate-50/55">
-                                  ¥ {t.baseSalary.toLocaleString(undefined, {minimumFractionDigits: 1, maximumFractionDigits: 1})}
-                                </td>
-                                <td className="px-4 py-3.5 text-right font-bold font-mono text-indigo-600 bg-indigo-50/20">
-                                  <div>¥ {t.commissionAmount.toLocaleString(undefined, {minimumFractionDigits: 1, maximumFractionDigits: 1})}</div>
-                                  <div className="text-[10px] text-indigo-500 font-normal mt-0.5">
-                                    <select
-                                      value={(() => {
-                                        const baseRateObj = teacherBaseRates.find(r => r.teacherName.trim().toLowerCase() === t.teacherName.trim().toLowerCase());
-                                        return (baseRateObj && baseRateObj.commissionRate !== undefined) ? baseRateObj.commissionRate : commissionRate;
-                                      })()}
-                                      onChange={(e) => {
-                                        const val = parseFloat(e.target.value);
-                                        const baseRateObj = teacherBaseRates.find(r => r.teacherName.trim().toLowerCase() === t.teacherName.trim().toLowerCase());
-                                        if (baseRateObj) {
-                                          updateTeacherCommissionRate(baseRateObj.teacherName, val);
-                                        } else {
-                                          // Create base rate object if not exists
-                                          const updated = [...teacherBaseRates, { teacherName: t.teacherName, baseRate: 100, commissionRate: val }];
-                                          setTeacherBaseRates(updated);
-                                          saveToLocalStorage('course_deduction_base_rates', updated);
-                                          showAlert(`已为 ${t.teacherName} 创建专属配置，并设置提成比例为 ${(val * 100).toFixed(0)}%！`);
-                                        }
-                                      }}
-                                      className="text-[10px] text-indigo-500 bg-transparent border-none cursor-pointer focus:ring-0 p-0 outline-none text-right font-semibold"
-                                    >
-                                      <option value={0.07}>7% (默认)</option>
-                                      <option value={0.06}>6%</option>
-                                      <option value={0.05}>5%</option>
-                                      <option value={0.08}>8%</option>
-                                      <option value={0.09}>9%</option>
-                                      <option value={0.10}>10%</option>
-                                    </select>
-                                  </div>
-                                </td>
-                                <td className="px-4 py-3.5 text-right font-bold font-mono text-slate-950 bg-indigo-50/10">
-                                  ¥ {t.totalSalary.toLocaleString(undefined, {minimumFractionDigits: 1, maximumFractionDigits: 1})}
-                                </td>
-                                <td className="px-4 py-3.5 text-center">
-                                  {t.substitutionDetails.length > 0 || t.makeupDetails.length > 0 ? (
-                                    <div className="group relative inline-block">
-                                      <span className="bg-amber-50 text-amber-700 border border-amber-200 rounded px-1.5 py-0.5 text-[10px] font-medium cursor-help">
-                                        {t.substitutionDetails.length + t.makeupDetails.length} 条记录
-                                      </span>
-                                      <div className="hidden group-hover:block absolute right-0 bottom-full mb-2 w-72 bg-slate-900 text-white text-[10px] p-3 rounded-lg shadow-xl z-50 leading-relaxed text-left space-y-1.5">
-                                        {t.substitutionDetails.length > 0 && (
-                                          <>
-                                            <div className="font-bold border-b border-slate-700 pb-1 text-amber-400">代课置换明细：</div>
-                                            {t.substitutionDetails.map((det, di) => (
-                                              <div key={di} className="truncate">{det}</div>
-                                            ))}
-                                          </>
-                                        )}
-                                        {t.makeupDetails.length > 0 && (
-                                          <>
-                                            <div className="font-bold border-b border-slate-700 pb-1 text-emerald-400 pt-1.5">补课课销明细：</div>
-                                            {t.makeupDetails.map((det, di) => (
-                                              <div key={di} className="truncate">{det}</div>
-                                            ))}
-                                          </>
-                                        )}
-                                      </div>
-                                    </div>
-                                  ) : (
-                                    <span className="text-slate-300 text-xs">-</span>
-                                  )}
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
-
-                    {/* REPORT NOTES */}
-                    <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-2">
-                      <h4 className="text-xs font-bold text-slate-700 flex items-center gap-1">
-                        <Info className="w-3.5 h-3.5 text-indigo-500" />
-                        工资算法解析说明
-                      </h4>
-                      <ul className="list-disc pl-4 text-xs text-slate-500 space-y-1.5">
-                        <li><strong>总结算课时</strong> = 名下班级总课时 - 代出课时 + 代入课时 + 录入的补课课时。</li>
-                        <li><strong>总课销金额 (应结课销)</strong> = 总结算课时 × 该教师个性化配置的课消基础单价。</li>
-                        <li><strong>课销提成 (提成所得)</strong> = 总课销金额 × 选择的提成比例 (可选择 6% 或 7%)，这是教师实际所得的课消提成。</li>
-                        <li><strong>加成提成累计</strong> = 满足特定“课时费加成”的班级<strong>纯课时数 (无论该班级学生人数是多少人，单次课时的加成固定不乘学生人数)</strong> × 对应的加成额度。</li>
-                        <li><strong>老师实际到手薪资</strong> = 课销提成 + 加成提成累计。</li>
-                      </ul>
-                    </div>
-
-                  </div>
-                )}
-              </div>
+              <PayrollReport teacherReportData={teacherReportData} commissionRate={commissionRate}
+                onExport={handleExportCSV}
+                onCommissionRateChange={handleCommissionRateChange}
+                onTeacherCommissionRateChange={handleTeacherCommissionRateChange} />
             )}
 
           </div>

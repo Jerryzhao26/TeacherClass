@@ -5,6 +5,8 @@ export interface Student {
 }
 
 export interface Lesson {
+  id?: string; // Stable worksheet row identity, assigned for legacy data on load
+  attendedCountOverride?: number;
   index: number; // 上课次数
   type: string; // "中" or "外"
   dateStr: string; // normalized date (YYYY-MM-DD)
@@ -24,6 +26,7 @@ export interface ClassBlock {
   classCode: string; // extracted numeric part, e.g. "200905"
   teacher: string; // teacher name
   schedule: string; // schedule text
+  frequencySource?: 'manual' | 'schedule' | 'history';
   frequency: 'once' | 'twice'; // once a week or twice a week
   students: Student[];
   lessons: Lesson[];
@@ -47,6 +50,8 @@ export interface TeacherBaseRate {
 
 export interface SubstitutionRecord {
   id: string;
+  blockId?: string;
+  lessonId?: string;
   dateStr: string; // YYYY-MM-DD
   classCode: string; // class code
   className: string; // full class name (for display)
@@ -64,6 +69,10 @@ export interface MakeupRecord {
 }
 
 export interface AppStateBackup {
+  version?: number;
+  classBlocks?: ClassBlock[];
+  fileName?: string;
+  commissionRate?: number;
   bonusRules: BonusRule[];
   teacherBaseRates: TeacherBaseRate[];
   substitutionRecords: SubstitutionRecord[];

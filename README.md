@@ -1,20 +1,43 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# TeacherClass · 课消管家
 
-# Run and deploy your AI Studio app
+培训机构 Excel 考勤导入、课销统计、代课与补课登记、教师提成结算工具。基于 React、TypeScript 和 Vite，数据保存在当前浏览器中，无需 Gemini API Key。
 
-This contains everything you need to run your app locally.
+## 本地运行
 
-View your app in AI Studio: https://ai.studio/apps/6221f3db-56f8-45bd-ba37-adfd51f1651f
+使用 Node.js 22 或更新版本：
 
-## Run Locally
+```sh
+npm ci
+npm run dev
+```
 
-**Prerequisites:**  Node.js
+## 验证与构建
 
+```sh
+npm run lint
+npm test
+npm run build
+```
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+`lint` 执行 TypeScript 类型检查。回归测试覆盖老师修正、代课归属、补课、加成、日期筛选、频次、Excel 解析、恢复默认及备份校验。GitHub Actions 会对 PR 和 main 分支执行上述检查。
+
+## 核算规则
+
+- 单节基数：一周一次中教 3、外教 2；一周两次中教 2、外教 1。
+- 课销课时 = 实际参课人数 × 单节基数，允许对单节基数及最终课销进行手动修正。
+- 课销归实际授课老师：包括代课登记和单节老师修正。修正优先于代课登记。
+- 课销金额 = 结算课销课时 × 教师基础单价。到手课酬 = 课销金额 × 教师提成比例 + 加成。
+- 加成按纯授课课时计算，不乘学生人数，并遵守加成开始日期。
+- 补课按登记的课销数量累加，沿用现有同时增加纯课时的规则。
+- 人工设置的频次优先；有明确排课时间时按排课识别，历史考勤不覆盖排课。无排课时间的班级使用历史记录估算，结算前需人工核对。
+- 代课选择具体上课记录，同一天同一节课不能重复录入。旧版代课记录仍按班级编号、日期及原老师匹配。
+
+## 数据与备份
+
+设置页可导出及导入 JSON 备份。新版备份包含课表、单节修正、教师配置、加成、代课、补课、文件名及全局提成比例。旧版配置备份仍可导入；备份未包含的部分不会被清空。
+
+导入前会校验完整结构及日期、数值，校验失败不写入数据。多项数据保存失败时会尝试回滚已写入部分。浏览器中的某部分旧数据损坏时，应用会跳过该部分并提示恢复。
+
+手动修正与原始导入值分开保存，“恢复默认”清除单节修正，仍保留单独登记的代课记录。旧版已经直接覆盖的原始课型和出勤人数无法从现有缓存推算回来；需要重新导入原始 Excel 后才能恢复原值。旧版未标注来源的班级频次按人工设置保留。
+
+Excel 解析库仅在导入时加载。工资算法、课时规则、备份校验和薪资报表组件分别维护，方便独立测试及后续扩展。
