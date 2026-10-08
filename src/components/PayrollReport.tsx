@@ -60,11 +60,11 @@ export function PayrollReport({ teacherReportData, commissionRate, onCommissionR
         <div className="space-y-6">
           
           {/* SUMMARY PAYROLL TABLE */}
-          <div className="overflow-x-auto border border-slate-200 rounded-xl bg-white shadow-sm">
-            <table className="w-full text-left border-collapse">
+          <div data-testid="payroll-scroll" className="relative overflow-x-auto border border-slate-200 rounded-xl bg-white shadow-sm">
+            <table className="w-full text-left border-separate border-spacing-0">
               <thead>
                 <tr className="bg-slate-50 border-b border-slate-200 text-slate-400 font-semibold text-xs whitespace-nowrap">
-                  <th className="px-4 py-3.5">老师姓名</th>
+                  <th scope="col" className="sticky left-0 z-20 min-w-28 whitespace-nowrap bg-slate-50 px-4 py-3.5 shadow-[2px_0_4px_-2px_rgba(15,23,42,0.2)]">老师姓名</th>
                   <th className="px-4 py-3.5 text-right">课消基础单价</th>
                   <th className="px-4 py-3.5 text-center">授课总次数</th>
                   <th className="px-4 py-3.5 text-right">名下班级课时<span className="text-[10px] text-slate-400 block font-normal">(乘人数)</span></th>
@@ -82,11 +82,11 @@ export function PayrollReport({ teacherReportData, commissionRate, onCommissionR
                   <th className="px-4 py-3.5 text-center">代/补课明细</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-slate-100 text-sm text-slate-700">
+              <tbody className="text-sm text-slate-700 [&_td]:border-b [&_td]:border-slate-100 [&_tr:last-child_td]:border-b-0">
                 {teacherReportData.map((t) => {
                   return (
-                    <tr key={t.teacherName} className="hover:bg-slate-50/60 transition-colors">
-                      <td className="px-4 py-3.5 font-bold text-slate-800">{t.teacherName}</td>
+                    <tr key={t.teacherName} className="group hover:bg-slate-50/60 transition-colors">
+                      <td className="sticky left-0 z-10 min-w-28 whitespace-nowrap bg-white px-4 py-3.5 font-bold text-slate-800 shadow-[2px_0_4px_-2px_rgba(15,23,42,0.2)] group-hover:bg-slate-50">{t.teacherName}</td>
                       <td className="px-4 py-3.5 text-right font-mono">¥ {t.baseRate} <span className="text-[10px] text-slate-400">/课时</span></td>
                       <td className="px-4 py-3.5 text-center font-mono font-medium">{t.sessionsCount} <span className="text-xs text-slate-400">次</span></td>
                       <td className="px-4 py-3.5 text-right font-mono">{t.baseHours.toFixed(1)}</td>
