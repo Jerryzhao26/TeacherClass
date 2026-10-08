@@ -344,7 +344,8 @@ export default function App() {
       if (filterTeacher && item.actualTeacher.trim().toLowerCase() !== filterTeacher.trim().toLowerCase()) {
         return false;
       }
-      if (filterClassCode && item.classCode !== filterClassCode) {
+      const classQuery = filterClassCode.trim().toLowerCase();
+      if (classQuery && !item.classCode.toLowerCase().includes(classQuery) && !item.block.className.toLowerCase().includes(classQuery)) {
         return false;
       }
       return true;
@@ -1170,7 +1171,7 @@ export default function App() {
                           </div>
                           <div>
                             <h3 className="text-xs font-bold text-slate-800">
-                              课消明细筛选索引
+                              课销明细筛选
                             </h3>
                             <p className="text-[10px] text-slate-400">
                               当前区间共 {resolvedLessons.length} 节记录
@@ -1199,21 +1200,24 @@ export default function App() {
                             </select>
                           </div>
 
-                          {/* Class selector */}
+                          {/* Class code search with optional suggestions */}
                           <div className="flex items-center gap-1.5">
-                            <label className="text-xs font-semibold text-slate-500 whitespace-nowrap">上课班级:</label>
-                            <select
+                            <label htmlFor="class-code-filter" className="text-xs font-semibold text-slate-500 whitespace-nowrap">班级编号:</label>
+                            <input
+                              id="class-code-filter"
+                              type="text"
+                              list="class-code-filter-options"
                               value={filterClassCode}
                               onChange={(e) => setFilterClassCode(e.target.value)}
-                              className="text-xs bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-xl px-2.5 py-2 text-slate-700 outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 transition max-w-[180px] cursor-pointer"
-                            >
-                              <option value="">全部班级</option>
+                              placeholder="输入编号，如 260916"
+                              autoComplete="off"
+                              className="w-48 min-w-0 text-xs bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-xl px-2.5 py-2 text-slate-700 outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 transition"
+                            />
+                            <datalist id="class-code-filter-options">
                               {uniqueClassesList.map(c => (
-                                <option key={c.classCode} value={c.classCode}>
-                                  {c.className}
-                                </option>
+                                <option key={c.classCode} value={c.classCode} label={c.className} />
                               ))}
-                            </select>
+                            </datalist>
                           </div>
 
                           {/* Clear filters button */}
